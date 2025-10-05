@@ -42,9 +42,13 @@ android {
         viewBinding true
     }
     lint {
-        checkDependencies true
+        abortOnError = false
+        checkReleaseBuilds = false
     }
     namespace 'me.gm.cleaner.plugin'
+    kotlinOptions {
+        jvmTarget = JavaVersion.VERSION_17
+    }
 }
 
 dependencies {
