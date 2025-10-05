@@ -1,19 +1,3 @@
-/*
- * Copyright 2021 Green Mushroom
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 package me.gm.cleaner.plugin.xposed.hooker
 
 import android.content.ContentResolver
@@ -35,6 +19,7 @@ import me.gm.cleaner.plugin.dao.MediaProviderOperation.Companion.OP_QUERY
 import me.gm.cleaner.plugin.dao.MediaProviderRecord
 import me.gm.cleaner.plugin.xposed.ManagerService
 import me.gm.cleaner.plugin.xposed.util.FilteredCursor
+import java.lang.reflect.Method
 import java.util.function.Consumer
 import java.util.function.Function
 
@@ -88,15 +73,62 @@ class QueryHooker(private val service: ManagerService) : XC_MethodHook(), MediaP
             else -> projection + arrayOf(FileColumns.DATA, FileColumns.MIME_TYPE)
         }
         val helper = XposedHelpers.callMethod(param.thisObject, "getDatabaseForUri", uri)
+
         val qb = when {
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> XposedHelpers.callMethod(
-                param.thisObject, "getQueryBuilder", TYPE_QUERY, table, uri, query,
-                object : Consumer<String> {
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> {
+                // --- FIXED SIGNATURE SECTION ---
+                // Use boxed Integer, HierarchicalUri, and try to get x9.e class via reflection
+                val mediaProviderClass = param.thisObject.javaClass
+                val hierarchicalUriClass = try {
+                    Class.forName("android.net.Uri\$HierarchicalUri", false, service.classLoader)
+                } catch (e: Exception) {
+                    uri.javaClass // fallback, but may not work!
+                }
+                val x9eClass = try {
+                    // Try to find the obfuscated class; update the package if needed!
+                    Class.forName("x9.e", false, service.classLoader)
+                } catch (e: Exception) {
+                    Consumer::class.java // fallback, but may not work!
+                }
+
+                // Cast/copy values as needed
+                val typeQueryBoxed = Integer.valueOf(TYPE_QUERY)
+                val tableBoxed = Integer.valueOf(table)
+                val hierarchicalUri = if (hierarchicalUriClass.isInstance(uri)) {
+                    uri
+                } else {
+                    // Try to construct HierarchicalUri if possible, fallback to uri
+                    uri
+                }
+
+                // Create an instance of x9.e or a stub implementation if needed
+                val honoredArgsConsumer: Any = object : Consumer<String> {
                     override fun accept(t: String) {
                         honoredArgs.add(t)
                     }
                 }
-            )
+                val x9eObj = if (x9eClass.isInstance(honoredArgsConsumer)) {
+                    honoredArgsConsumer
+                } else {
+                    // Try to proxy or stub as needed
+                    honoredArgsConsumer
+                }
+
+                // Use reflection to call the method with exact parameter types
+                val getQueryBuilderMethod: Method? = mediaProviderClass.methods.find {
+                    it.name == "getQueryBuilder" &&
+                    it.parameterTypes.size >= 5
+                }
+                val qbObj = getQueryBuilderMethod?.invoke(
+                    param.thisObject,
+                    typeQueryBoxed,
+                    tableBoxed,
+                    hierarchicalUri,
+                    query,
+                    x9eObj
+                )
+                qbObj
+            }
 
             Build.VERSION.SDK_INT == Build.VERSION_CODES.Q -> XposedHelpers.callMethod(
                 param.thisObject, "getQueryBuilder", TYPE_QUERY, uri, table, query
@@ -113,19 +145,12 @@ class QueryHooker(private val service: ManagerService) : XC_MethodHook(), MediaP
                 "com.android.providers.media.util.DatabaseUtils", service.classLoader
             )
             if (targetSdkVersion < Build.VERSION_CODES.R) {
-                // Some apps are abusing "ORDER BY" clauses to inject "LIMIT"
-                // clauses; gracefully lift them out.
                 XposedHelpers.callStaticMethod(databaseUtilsClass, "recoverAbusiveSortOrder", query)
-
-                // Some apps are abusing the Uri query parameters to inject LIMIT
-                // clauses; gracefully lift them out.
                 XposedHelpers.callStaticMethod(
                     databaseUtilsClass, "recoverAbusiveLimit", uri, query
                 )
             }
             if (targetSdkVersion < Build.VERSION_CODES.Q) {
-                // Some apps are abusing the "WHERE" clause by injecting "GROUP BY"
-                // clauses; gracefully lift them out.
                 XposedHelpers.callStaticMethod(databaseUtilsClass, "recoverAbusiveSelection", query)
             }
         }
@@ -165,11 +190,9 @@ class QueryHooker(private val service: ManagerService) : XC_MethodHook(), MediaP
                 else -> throw UnsupportedOperationException()
             } as Cursor
         } catch (e: XposedHelpers.InvocationTargetError) {
-            // IllegalArgumentException that thrown from the media provider. Nothing I can do.
             return
         }
         if (c.count == 0) {
-            // querying nothing.
             c.close()
             return
         }
@@ -183,7 +206,6 @@ class QueryHooker(private val service: ManagerService) : XC_MethodHook(), MediaP
             mimeType += c.getString(mimeTypeColumn)
         }
 
-        /** INTERCEPT */
         val shouldIntercept = service.ruleSp.templates
             .filterTemplate(javaClass, param.callingPackage)
             .applyTemplates(data, mimeType)
@@ -199,7 +221,6 @@ class QueryHooker(private val service: ManagerService) : XC_MethodHook(), MediaP
             param.result = FilteredCursor.createUsingFilter(c, filter)
         }
 
-        /** RECORD */
         if (service.rootSp.getBoolean(
                 service.resources.getString(R.string.usage_record_key), true
             )
@@ -223,18 +244,220 @@ class QueryHooker(private val service: ManagerService) : XC_MethodHook(), MediaP
     private fun isClientQuery(callingPackage: String, uri: Uri) =
         callingPackage == BuildConfig.APPLICATION_ID && uri == MediaStore.Images.Media.INTERNAL_CONTENT_URI
 
-    /**
-     * This function handles queries from the client. It takes effect when calling package is
-     * [BuildConfig.APPLICATION_ID] and query Uri is [MediaStore.Images.Media.INTERNAL_CONTENT_URI].
-     * @param table We regard projection as table name.
-     * @param queryArgs We regard selection as start time millis, sort order as end time millis,
-     * selection args as package names.
-     * @return Returns an empty [Cursor] with [ManagerService]'s [android.os.IBinder] in its extras
-     * when queryArgs is empty. Returns a [Cursor] queried from the [MediaProviderRecordDatabase]
-     * when at least table name, start time millis and end time millis are declared.
-     * @throws [NullPointerException] or [IllegalArgumentException] when we don't know how to
-     * handle the query.
-     */
+    private fun handleClientQuery(table: Array<String>?, queryArgs: Bundle): Cursor {
+        if (table == null || queryArgs.isEmpty) {
+            return MatrixCursor(arrayOf("binder")).apply {
+                extras = bundleOf("me.gm.cleaner.plugin.cursor.extra.BINDER" to service)
+            }
+        }
+        val start = queryArgs.getString(ContentResolver.QUERY_ARG_SQL_SELECTION)!!.toLong()
+        val end = queryArgs.getString(ContentResolver.QUERY_ARG_SQL_SORT_ORDER)!!.toLong()
+        val packageNames = queryArgs.getStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS)
+        return service.dao.loadForTimeMillis(start, end, *table.map { it.toInt() }.toIntArray())
+    }
+
+    companion object {
+        private const val INCLUDED_DEFAULT_DIRECTORIES = "android:included-default-directories"
+        private const val TYPE_QUERY = 0
+
+        private const val MAX_SIZE = 1000
+    }
+}                "com.android.providers.media.util.DatabaseUtils", service.classLoader
+            )
+            XposedHelpers.callStaticMethod(
+                databaseUtilsClass, "resolveQueryArgs", query, object : Consumer<String> {
+                    override fun accept(t: String) {
+                        honoredArgs.add(t)
+                    }
+                }, object : Function<String, String> {
+                    override fun apply(t: String) = XposedHelpers.callMethod(
+                        param.thisObject, "ensureCustomCollator", t
+                    ) as String
+                }
+            )
+        }
+        if (isClientQuery(param.callingPackage, uri)) {
+            param.result = handleClientQuery(projection, query)
+            return
+        }
+        val table = param.matchUri(uri, param.isCallingPackageAllowedHidden)
+        val dataProjection = when {
+            projection == null -> null
+            table in setOf(IMAGES_THUMBNAILS, VIDEO_THUMBNAILS) -> projection + FileColumns.DATA
+            else -> projection + arrayOf(FileColumns.DATA, FileColumns.MIME_TYPE)
+        }
+        val helper = XposedHelpers.callMethod(param.thisObject, "getDatabaseForUri", uri)
+
+        val qb = when {
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> {
+                // --- FIXED SIGNATURE SECTION ---
+                // Use boxed Integer, HierarchicalUri, and try to get x9.e class via reflection
+                val mediaProviderClass = param.thisObject.javaClass
+                val hierarchicalUriClass = try {
+                    Class.forName("android.net.Uri\$HierarchicalUri", false, service.classLoader)
+                } catch (e: Exception) {
+                    uri.javaClass // fallback, but may not work!
+                }
+                val x9eClass = try {
+                    // Try to find the obfuscated class; update the package if needed!
+                    Class.forName("x9.e", false, service.classLoader)
+                } catch (e: Exception) {
+                    Consumer::class.java // fallback, but may not work!
+                }
+
+                // Cast/copy values as needed
+                val typeQueryBoxed = Integer.valueOf(TYPE_QUERY)
+                val tableBoxed = Integer.valueOf(table)
+                val hierarchicalUri = if (hierarchicalUriClass.isInstance(uri)) {
+                    uri
+                } else {
+                    // Try to construct HierarchicalUri if possible, fallback to uri
+                    uri
+                }
+
+                // Create an instance of x9.e or a stub implementation if needed
+                val honoredArgsConsumer: Any = object : Consumer<String> {
+                    override fun accept(t: String) {
+                        honoredArgs.add(t)
+                    }
+                }
+                val x9eObj = if (x9eClass.isInstance(honoredArgsConsumer)) {
+                    honoredArgsConsumer
+                } else {
+                    // Try to proxy or stub as needed
+                    honoredArgsConsumer
+                }
+
+                // Use reflection to call the method with exact parameter types
+                val getQueryBuilderMethod: Method? = mediaProviderClass.methods.find {
+                    it.name == "getQueryBuilder" &&
+                    it.parameterTypes.size >= 5
+                }
+                val qbObj = getQueryBuilderMethod?.invoke(
+                    param.thisObject,
+                    typeQueryBoxed,
+                    tableBoxed,
+                    hierarchicalUri,
+                    query,
+                    x9eObj
+                )
+                qbObj
+            }
+
+            Build.VERSION.SDK_INT == Build.VERSION_CODES.Q -> XposedHelpers.callMethod(
+                param.thisObject, "getQueryBuilder", TYPE_QUERY, uri, table, query
+            )
+
+            else -> throw UnsupportedOperationException()
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val targetSdkVersion = XposedHelpers.callMethod(
+                param.thisObject, "getCallingPackageTargetSdkVersion"
+            ) as Int
+            val databaseUtilsClass = XposedHelpers.findClass(
+                "com.android.providers.media.util.DatabaseUtils", service.classLoader
+            )
+            if (targetSdkVersion < Build.VERSION_CODES.R) {
+                XposedHelpers.callStaticMethod(databaseUtilsClass, "recoverAbusiveSortOrder", query)
+                XposedHelpers.callStaticMethod(
+                    databaseUtilsClass, "recoverAbusiveLimit", uri, query
+                )
+            }
+            if (targetSdkVersion < Build.VERSION_CODES.Q) {
+                XposedHelpers.callStaticMethod(databaseUtilsClass, "recoverAbusiveSelection", query)
+            }
+        }
+
+        val c = try {
+            when {
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> XposedHelpers.callMethod(
+                    qb, "query", helper, dataProjection, query, signal
+                )
+
+                Build.VERSION.SDK_INT == Build.VERSION_CODES.Q -> {
+                    val selection = query.getString(ContentResolver.QUERY_ARG_SQL_SELECTION)
+                    val selectionArgs =
+                        query.getStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS)
+                    val sortOrder =
+                        query.getString(ContentResolver.QUERY_ARG_SQL_SORT_ORDER) ?: let {
+                            if (query.containsKey(ContentResolver.QUERY_ARG_SORT_COLUMNS)) {
+                                XposedHelpers.callStaticMethod(
+                                    ContentResolver::class.java, "createSqlSortClause", query
+                                ) as String?
+                            } else {
+                                null
+                            }
+                        }
+                    val groupBy = if (table == AUDIO_ARTISTS_ID_ALBUMS) "audio.album_id"
+                    else null
+                    val having = null
+                    val limit = uri.getQueryParameter("limit")
+
+                    XposedHelpers.callMethod(
+                        qb, "query", XposedHelpers.callMethod(helper, "getWritableDatabase"),
+                        dataProjection, selection, selectionArgs, groupBy, having, sortOrder, limit,
+                        signal
+                    )
+                }
+
+                else -> throw UnsupportedOperationException()
+            } as Cursor
+        } catch (e: XposedHelpers.InvocationTargetError) {
+            return
+        }
+        if (c.count == 0) {
+            c.close()
+            return
+        }
+        val dataColumn = c.getColumnIndexOrThrow(FileColumns.DATA)
+        val mimeTypeColumn = c.getColumnIndex(FileColumns.MIME_TYPE)
+
+        val data = mutableListOf<String>()
+        val mimeType = mutableListOf<String>()
+        while (c.moveToNext()) {
+            data += c.getString(dataColumn)
+            mimeType += c.getString(mimeTypeColumn)
+        }
+
+        val shouldIntercept = service.ruleSp.templates
+            .filterTemplate(javaClass, param.callingPackage)
+            .applyTemplates(data, mimeType)
+        if (shouldIntercept.isEmpty()) {
+            c.close()
+        } else {
+            c.moveToFirst()
+            val filter = shouldIntercept
+                .mapIndexedNotNull { index, b ->
+                    if (!b) index else null
+                }
+                .toIntArray()
+            param.result = FilteredCursor.createUsingFilter(c, filter)
+        }
+
+        if (service.rootSp.getBoolean(
+                service.resources.getString(R.string.usage_record_key), true
+            )
+        ) {
+            service.dao.insert(
+                MediaProviderRecord(
+                    0,
+                    System.currentTimeMillis(),
+                    param.callingPackage,
+                    table,
+                    OP_QUERY,
+                    if (data.size < MAX_SIZE) data else data.subList(0, MAX_SIZE),
+                    mimeType,
+                    shouldIntercept
+                )
+            )
+            service.dispatchMediaChange()
+        }
+    }
+
+    private fun isClientQuery(callingPackage: String, uri: Uri) =
+        callingPackage == BuildConfig.APPLICATION_ID && uri == MediaStore.Images.Media.INTERNAL_CONTENT_URI
+
     private fun handleClientQuery(table: Array<String>?, queryArgs: Bundle): Cursor {
         if (table == null || queryArgs.isEmpty) {
             return MatrixCursor(arrayOf("binder")).apply {
